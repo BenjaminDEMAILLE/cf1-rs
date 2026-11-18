@@ -56,16 +56,20 @@ where
     /// Each bin is deduplicated independently, in parallel waves of bins
     /// (canonical minimizers guarantee no cross-bin duplicates); see
     /// [`build_with_clone_threshold`](Self::build_with_clone_threshold) for
-    /// how the keys reach the MPHF construction.
+    /// how the keys reach the MPHF construction. The construction stays in
+    /// memory while its estimated peak ([`IN_MEMORY_BYTES_PER_KEY`] per key)
+    /// fits in `memory_budget_bytes`, and up to [`DEFAULT_CLONE_THRESHOLD`]
+    /// keys; beyond that it streams the keys.
     pub fn build(
         partitioning: &Partitioning,
         work_dir: &Path,
-        _memory_budget_bytes: usize,
+        memory_budget_bytes: usize,
     ) -> anyhow::Result<Self>
     where
         <Kmer<K> as KmerBits>::Storage: RadixSortDedup,
     {
-        Self::build_with_clone_threshold(partitioning, work_dir, DEFAULT_CLONE_THRESHOLD)
+        let threshold = clone_threshold_for_budget::<K>(memory_budget_bytes);
+        Self::build_with_clone_threshold(partitioning, work_dir, threshold)
     }
 
     /// Build MPHF with an explicit `clone_threshold`.
@@ -119,7 +123,12 @@ where
         );
 
         // Reserves address space only: pages are committed as keys are written.
-        let mut keys: Vec<KmerKey<K>> = Vec::with_capacity(clone_threshold);
+        // The reservation stays at least DEFAULT_CLONE_THRESHOLD keys even under
+        // a smaller budget: a smaller (still multi-GB) block may be served by
+        // the allocator from committed memory (e.g. a mimalloc arena) instead of
+        // a fresh, lazily committed mapping, which raised the peak RSS.
+        let mut keys: Vec<KmerKey<K>> =
+            Vec::with_capacity(clone_threshold.max(DEFAULT_CLONE_THRESHOLD));
         let mut per_bin_counts: Vec<usize> = Vec::with_capacity(num_bins);
         let bins: Vec<usize> = (0..num_bins).collect();
         let mut waves = bins.chunks(2 * rayon::current_num_threads());
@@ -248,6 +257,22 @@ where
 /// Default [`Mphf::build_with_clone_threshold`] threshold: up to this many
 /// distinct k-mers the MPHF is built in memory.
 pub const DEFAULT_CLONE_THRESHOLD: usize = 300_000_000;
+
+/// Estimated peak memory, in bytes per key beyond the k-mer itself, of the
+/// in-memory MPHF construction (PHastR needs about 10 bytes per key with one
+/// thread and 12 with eight or more).
+pub const IN_MEMORY_BYTES_PER_KEY: usize = 12;
+
+/// The largest number of keys whose in-memory MPHF construction fits in
+/// `memory_budget_bytes` (keys plus construction memory), capped at
+/// [`DEFAULT_CLONE_THRESHOLD`].
+pub fn clone_threshold_for_budget<const K: usize>(memory_budget_bytes: usize) -> usize
+where
+    Kmer<K>: KmerBits,
+{
+    let per_key = std::mem::size_of::<<Kmer<K> as KmerBits>::Storage>() + IN_MEMORY_BYTES_PER_KEY;
+    (memory_budget_bytes / per_key).min(DEFAULT_CLONE_THRESHOLD)
+}
 
 /// Deduplicate the bins of `wave` in parallel, returning each bin's sorted
 /// distinct canonical k-mers.
